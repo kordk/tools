@@ -3,7 +3,7 @@ Miscellaneous tools
 
 <H3>qtime</H3>
 
-A tool to report some timing information about a jobs submitted to an Sun Grid Engine (SGE) cluster. The output based on Jim Kent and Galt Barber's para command and the time option in the parasol batch system.
+A python script to report some timing information about a jobs submitted to an Sun Grid Engine (SGE) cluster. The output based on Jim Kent and Galt Barber's para command and the time option in the parasol batch system.
 
 <pre>
 qtime h
