@@ -1,0 +1,277 @@
+#!/usr/bin/env python
+
+import os,sys,subprocess,time,datetime
+import re,getopt,string
+from subprocess import Popen, PIPE
+
+# kord@kober.us
+# kord.kober@ucsf.edu
+# output based on Jim Kent and Galt Barber's para command and the time option
+# in the parasol batch system.
+
+# SGE accounting(5) and getusage(2)
+# REF: http://linux.die.net/man/5/sge_accounting
+#      http://linux.die.net/man/2/getrusage
+
+# 20140205 - KMK. Corrected max. virtual memory reporting; Removed erroneous integral memory report.
+# 20170810 - KMK. Removed SGE_HOME environment variable requirement.
+
+DEBUG=0
+
+# Ref: http://codecomments.wordpress.com/2008/03/17/simple-method-to-calculate-median-in-python/
+def getMedian(numericValues):
+  theValues = sorted(numericValues)
+  if len(theValues) % 2 == 1:
+    return theValues[(len(theValues)+1)/2-1]
+  else:
+    lower = theValues[len(theValues)/2-1]
+    upper = theValues[len(theValues)/2]
+    return (float(lower + upper)) / 2
+    
+def readQacct(jid):
+    jH={}
+    qacct = 'qacct -j ' + jid
+    tmpH={}
+    jH['summary']={}
+    jH['summary']['t_ru_wallclock']=0.0
+    jH['summary']['ru_utime']=0.0
+    jH['summary']['ru_stime']=0.0
+    jH['summary']['t_tasks']=0.0
+    jH['summary']['shortest']=10000000000000000000
+    jH['summary']['longest']=0
+    jH['summary']['qsub_time']=""  # Wed Dec 21 04:35:41 2011
+    for line in os.popen(qacct).readlines():
+        lineA = line.strip("\n").split()
+        if DEBUG: print "[readQacct]",lineA
+        if list(lineA[0])[0] == '=':
+            if DEBUG: print "[readQacct] New record."
+            if tmpH.has_key('taskid'):
+                tid=tmpH['taskid']
+                jH[tid]=tmpH
+                if DEBUG: print "[readQacct]",tmpH
+            tmpH={}
+        else:
+            tmpH[lineA[0]]=" ".join(lineA[1:])
+            
+    # store the last one
+    if tmpH.has_key('taskid'):
+        tid=tmpH['taskid']
+        jH[tid]=tmpH
+        if DEBUG: print "[readQacct]",tmpH
+    
+    return jH
+
+def collectStats(jH):
+    newH=jH.copy()
+    if DEBUG: print "[collectStats] newH.keys():",newH.keys()
+    if DEBUG: print "[collectStats] newH['summary'].keys():",newH['summary'].keys()
+    timesA = []
+    newH['summary']['failed']=0
+    newH['summary']['zerotime']=0
+    newH['summary']['ru_maxrss']=0
+    newH['summary']['mem']=0.0
+    newH['summary']['maxvmem'] = 0.0
+    newH['summary']['maxvmem_total'] = 0.0
+    newH['summary']['memMb'] = 0.0
+    newH['summary']['qsubDuration']=0.0
+    newH['summary']['jobName']=""
+    for task,tH in jH.iteritems():
+        if task == "summary":
+            continue
+        if DEBUG: print "[collectStats]",task,tH
+        newH['summary']['t_ru_wallclock']+=int(tH['ru_wallclock'])
+        newH['summary']['ru_utime']+=float(tH['ru_utime'])
+        newH['summary']['ru_stime']+=float(tH['ru_stime'])
+        newH['summary']['jobName']=tH['jobname']
+        
+        if DEBUG: print "[collectStats]",tH['ru_wallclock'],newH['summary']['shortest']
+        timesA.append(int(tH['ru_wallclock']))
+        if int(tH['ru_wallclock']) < int(newH['summary']['shortest']):
+            if int(tH['ru_wallclock']) > 0.0:
+                #print newH['summary']['shortest'],int(tH['ru_wallclock'])
+                newH['summary']['shortest']=int(tH['ru_wallclock'])
+            
+        #if DEBUG: print "[collectStats]",tH['ru_wallclock'],newH['summary']['longest']
+        if int(tH['ru_wallclock']) > int(newH['summary']['longest']):
+            newH['summary']['longest']=int(tH['ru_wallclock'])
+        
+        if tH['failed'] == "1":
+            newH['summary']['failed']+=1
+    
+        if tH['ru_wallclock'] == "0":
+            newH['summary']['zerotime']+=1
+        
+        if DEBUG: print "[collectStats] mem:", float(tH['mem']),newH['summary']['mem']
+        if float(tH['mem']) > newH['summary']['mem']:
+            newH['summary']['memMb'] = float(tH['mem'])/float(tH['cpu'])*1024
+        
+        if DEBUG: print "[collectStats] myMaxVm (raw):",tH['maxvmem']
+        
+        myMaxVm=0
+        if tH['maxvmem'].find('M') >0:
+          myMaxVm = float(tH['maxvmem'].strip('M')) *1024 *1024
+          
+        if tH['maxvmem'].find('G') >0:
+          myMaxVm = float(tH['maxvmem'].strip('G')) *1024 *1024 *1024
+          
+        if DEBUG: print "[collectStats] myMaxVm (bytes):",myMaxVm
+        if myMaxVm > newH['summary']['maxvmem']:
+            newH['summary']['maxvmem'] = myMaxVm
+        newH['summary']['maxvmem_total'] += myMaxVm
+        if DEBUG: print "[collectStats] newH['summary']['maxvmem']  (bytes):",newH['summary']['maxvmem'] 
+        if tH['end_time'] == '-/-':
+            duration=0.0
+        else:
+            subTime=time.mktime(time.strptime(tH['qsub_time']))
+            endTime=time.mktime(time.strptime(tH['end_time']))
+            duration=endTime-subTime
+        if DEBUG: print "[collectStats] job duration:", subTime,endTime,duration
+        if duration > newH['summary']['qsubDuration']:
+          newH['summary']['qsubDuration']=duration
+    
+    newH['summary']['median'] = getMedian(timesA)
+    
+    
+    return newH
+
+#### Give some usage information for this script #######################################
+def usage(errorNum):
+    print "qtime - List timing information about a Sun Grid Engine job."
+    print 
+    print "usage:  qtime [hD] -j [job_id|job_name|pattern]"
+    sys.exit(errorNum)
+
+#### main #######################################
+def main(argv):
+    jId=0
+    
+    try:
+        opts, args = getopt.getopt(argv, "hf:j:D", ["help","jobid","debug"])
+    except getopt.GetoptError,err:
+        print str(err)
+        usage(20)
+    for opt, arg in opts:
+        if opt in ("-h", "--help"):
+            usage(21)
+        if opt in ("-j", "--jobid"):
+            jId = arg
+        elif opt in ("-D", "--debug"):
+            global DEBUG
+            DEBUG = 1
+    
+    if jId == 0:
+        usage(201)
+
+    #if not os.environ.has_key('SGE_ROOT'):
+    #    print "Unable to locate your SGE installation. Make sure your environment variables are set correctly."
+    #    sys.exit(30)
+    
+    jobH = readQacct(jId)
+    jobH = collectStats(jobH)
+    
+    #job_number=""
+    #job_number_cmd = 'qstat -j ' + jId 
+    #for line in os.popen2(job_number_cmd,'/dev/null').readlines():
+    #    lineA=line.strip("\n").split()
+    #    if lineA[0] ==  "job_number":
+    #        job_number=lineA[1]
+    #p = subprocess.Popen(job_number_cmd, shell=True, stdin=PIPE, stdout=PIPE, close_fds=True)
+    #(child_stdin, child_stdout) = (p.stdin, p.stdout)
+    #job_number = child_stdout
+
+    #if job_number=="":
+    #    job_number=len(jobH)-1
+    #print job_number,"tasks in job"
+    
+    #para time
+    #431 jobs in batch
+    #0 jobs (including everybody's) in Parasol queue.
+    #Checking finished jobs
+    #Completed: 431 of 431 jobs
+    #CPU time in finished jobs:      20032s     333.87m     5.56h    0.23d  0.001 y
+    #IO & Wait Time:                  1963s      32.72m     0.55h    0.02d  0.000 y
+    #Average job time:                  51s       0.85m     0.01h    0.00d
+    #Longest running job:                0s       0.00m     0.00h    0.00d
+    #Longest finished job:              77s       1.28m     0.02h    0.00d
+    #Submission to last job:          1870s      31.17m     0.52h    0.02d
+
+    print "Checking completed tasks for job",jId,":'",jobH['summary']['jobName'],"'"
+    print "Completed: %d tasks " % ( len(jobH)-1 )
+    print "Tasks failed:",jobH['summary']['failed'],"(",jobH['summary']['zerotime'],"zero-time tasks )"
+    
+    if DEBUG:
+      print "[main] jobH['summary']:",jobH['summary']
+    mem    = "%0.2f" % ( jobH['summary']['memMb'] )
+    maxvm_mb  = jobH['summary']['maxvmem'] /1024.0 /1024.0
+    maxvm_avg_mb = jobH['summary']['maxvmem_total']/(float(len(jobH)-1)) /1024 /1024
+    print "Maximum task virtual memory usage: %.2fM (max.) %.2fM (avg.)" % (maxvm_mb, maxvm_avg_mb)
+    
+    
+    sec=jobH['summary']['t_ru_wallclock']
+    s="%ds"    % (sec)
+    m="%0.2fm" % (sec / 60.0)
+    h="%0.2fh" % (sec / 3600.0)
+    d="%0.2fd" % (sec / 86400.0)
+    y="%0.2fy" % (sec / 31536000.0)
+    print "Wallclock time in finished tasks: %10s %9s %8s %7s %6s" % (s,m,h,d,y)
+    
+    sec=jobH['summary']['ru_utime']
+    s="%ds"    % (sec)
+    m="%0.2fm" % (sec / 60.0)
+    h="%0.2fh" % (sec / 3600.0)
+    d="%0.2fd" % (sec / 86400.0)
+    y="%0.2fy" % (sec / 31536000.0)
+    if jobH['summary']['t_ru_wallclock'] > 0.0:
+      pct="%0.2f%%" % ( jobH['summary']['ru_utime']/jobH['summary']['t_ru_wallclock']*100 )
+    else:
+      pct=0.0
+    print "User time    (%7s):           %10s %9s %8s %7s %6s" % (pct,s,m,h,d,y)
+    
+    sec=jobH['summary']['ru_stime']
+    s="%ds"    % (sec)
+    m="%0.2fm" % (sec / 60.0)
+    h="%0.2fh" % (sec / 3600.0)
+    d="%0.2fd" % (sec / 86400.0)
+    y="%0.2fy" % (sec / 31536000.0)
+    if jobH['summary']['t_ru_wallclock'] > 0.0:
+      pct="%0.2f%%" % ( jobH['summary']['ru_stime']/jobH['summary']['t_ru_wallclock']*100 )
+    else:
+      pct=0.0
+    print "System time  (%7s):           %10s %9s %8s %7s %6s" % (pct,s,m,h,d,y)
+    
+    sec= float(jobH['summary']['t_ru_wallclock']) / float( len(jobH)-1 )
+    s="%ds"    % (sec)
+    m="%0.2fm" % (sec / 60.0)
+    h="%0.2fh" % (sec / 3600.0)
+    d="%0.2fd" % (sec / 86400.0)
+    y="%0.2fy" % (sec / 31536000.0)
+    print "Average wallclock task time:      %10s %9s %8s %7s %6s" % (s,m,h,d,y)
+    
+    sec=float(jobH['summary']['longest'])
+    s="%ds"    % (sec)
+    m="%0.2fm" % (sec / 60.0)
+    h="%0.2fh" % (sec / 3600.0)
+    d="%0.2fd" % (sec / 86400.0)
+    y="%0.2fy" % (sec / 31536000.0)
+    print "Longest completed task:           %10s %9s %8s %7s %6s" % (s,m,h,d,y)
+
+    sec=float(jobH['summary']['qsubDuration'])
+    s="%ds"    % (sec)
+    m="%0.2fm" % (sec / 60.0)
+    h="%0.2fh" % (sec / 3600.0)
+    d="%0.2fd" % (sec / 86400.0)
+    y="%0.2fy" % (sec / 31536000.0)
+    print "Submission to last task:          %10s %9s %8s %7s %6s" % (s,m,h,d,y)   
+    
+    #short  = "%0.2f" % ( float(jobH['summary']['shortest']) / 60.0 )
+    #long   = "%0.2f" % ( float(jobH['summary']['longest'])  / 60.0 )
+    #med    = "%0.2f" % ( float(jobH['summary']['median'])   / 60.0 )
+    #avg    = "%0.2f" % ( (float(jobH['summary']['longest']) - float(jobH['summary']['shortest']) / 2.0) / 60 )
+    #print "%d jobs completed (shortest non-zero %sm, mean %sm, median %sm, longest %sm)." % (len(jobH)-1, short, avg, med, long )
+    
+    
+    
+    
+#### Start here. #######################################
+if __name__ == "__main__":
+    main(sys.argv[1:])
