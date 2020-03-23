@@ -1,5 +1,5 @@
 # tools
-Miscellaneous tools
+Miscellaneous software tools related to bioinformatics and data science.
 
 <H3>qtime</H3>
 
